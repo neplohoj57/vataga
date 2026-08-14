@@ -16,7 +16,7 @@ import {
 import {
   createOutgoingTransfer, createIncomingTransfer, getTransfer, getAllTransfers,
   removeTransfer, getTransferProgress, getTransferSpeed, getTransferETA,
-  formatBytes, formatSpeed, formatETA, prepareChunk, handleIncomingChunk,
+  formatBytes, formatSpeed, formatETA, handleIncomingChunk,
   assembleFile, clearAllTransfers, CHUNK_SIZE
 } from './files.js';
 import {
@@ -25,6 +25,7 @@ import {
 } from './reconnect.js';
 
 let peer = null;
+let isHost = false;
 let isMuted = false;
 let isDeafened = false;
 let isPTTActive = false;
@@ -33,6 +34,7 @@ let isVAMode = false;
 let vaThreshold = 30;
 let vuInterval = null;
 let fileInput = null;
+let joined = false;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -62,8 +64,7 @@ function bindUI() {
   $('#toggle-agc').addEventListener('change', updateAudioSettings);
   $('#toggle-va').addEventListener('change', (e) => {
     isVAMode = e.target.checked;
-    if (isVAMode) isPTTMode = false;
-    updateCtrlButtons();
+    if (isVAMode) { isPTTMode = false; $('#btn-ptt').classList.remove('active'); }
   });
   $('#va-threshold').addEventListener('input', (e) => {
     vaThreshold = parseInt(e.target.value);
@@ -87,7 +88,7 @@ function bindUI() {
 
   window.addEventListener('screen-share-stopped', () => {
     updateScreenShareUI(false);
-    broadcastMessage({ type: 'screen-stopped' });
+    broadcastToAll({ type: 'screen-stopped' });
   });
 }
 
@@ -95,59 +96,67 @@ function checkUrlRoom() {
   const params = new URLSearchParams(window.location.search);
   const room = params.get('room');
   if (room) {
-    $('#input-room').value = room;
+    $('#input-room').value = room.toUpperCase();
   }
 }
 
-async function joinRoom(isCreate) {
+async function joinRoom(create) {
+  if (joined) return;
+  joined = true;
+
   const name = $('#input-name').value.trim() || 'Аноним';
-  let roomCode = $('#input-room').value.trim();
+  let roomCode = $('#input-room').value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
 
-  if (!roomCode && isCreate) {
+  if (!roomCode || roomCode.length < 2) {
     roomCode = generateRoomCode();
   }
-  if (!roomCode) {
-    roomCode = generateRoomCode();
-  }
-
-  roomCode = roomCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (roomCode.length < 2) roomCode = generateRoomCode();
 
   setLocalName(name);
   setCurrentRoom(roomCode);
+  isHost = create;
 
   showScreen('room');
   $('#room-code-display').textContent = roomCode;
-  addLocalMember();
+  addMember('local', name);
   logEvent('join', `${name} зашёл в комнату`);
   renderMembers();
   renderEventLog();
 
   try {
-    const stream = await captureMicrophone();
-    const peerId = 'vataga-' + roomCode + '-' + generateRoomCode().toLowerCase();
-    setLocalPeerId(peerId);
+    await captureMicrophone();
+    const myPeerId = 'vataga-' + Date.now().toString(36) + '-' + Math.random().toString(36).substr(2, 6);
+    setLocalPeerId(myPeerId);
 
-    peer = createPeer(peerId);
+    const roomPeerId = getFullRoomId(roomCode);
+
+    if (create) {
+      await createRoom(roomPeerId, myPeerId, name);
+    } else {
+      await joinExistingRoom(roomPeerId, myPeerId, name);
+    }
+
+    startVuMeter();
+    updateUrl(roomCode);
+  } catch (e) {
+    console.error('Failed to join room:', e);
+    logEvent('leave', 'Ошибка: ' + e.message);
+    renderEventLog();
+    joined = false;
+  }
+}
+
+async function createRoom(roomPeerId, myPeerId, name) {
+  return new Promise((resolve, reject) => {
+    peer = createPeer(roomPeerId);
 
     peer.on('open', (id) => {
-      setLocalPeerId(id);
-      const fullId = getFullRoomId(roomCode);
-      const conn = peer.connect(fullId, {
-        metadata: { name, type: 'room-join' },
-        serialization: 'json',
-        reliable: true
-      });
-      conn.on('open', () => {
-        conn.send({ type: 'join', name, peerId: id });
-      });
-      conn.on('data', (data) => handleControlData(conn, data));
-      conn.on('close', () => {});
-      conn.on('error', (e) => console.warn('Control conn error:', e));
+      logEvent('join', `Комната создана: ${getCurrentRoom()}`);
+      renderEventLog();
+      resolve();
     });
 
     peer.on('connection', (conn) => {
-      handleIncomingConnection(conn);
+      handleNewPeerConnection(conn);
     });
 
     peer.on('call', (call) => {
@@ -155,65 +164,151 @@ async function joinRoom(isCreate) {
     });
 
     peer.on('disconnected', () => {
-      console.warn('PeerJS disconnected, attempting reconnect...');
-      setTimeout(() => {
-        if (peer && !peer.destroyed) {
-          try { peer.reconnect(); } catch(e) {}
-        }
-      }, 2000);
-    });
-
-    peer.on('error', (err) => {
-      console.error('PeerJS error:', err.type, err);
-      if (err.type === 'unavailable-id') {
-        const newId = 'vataga-' + roomCode + '-' + generateRoomCode().toLowerCase();
-        setLocalPeerId(newId);
-        peer = createPeer(newId);
+      if (peer && !peer.destroyed) {
+        setTimeout(() => { try { peer.reconnect(); } catch(e) {} }, 2000);
       }
     });
 
-    startVuMeter();
-    updateUrl(roomCode);
-  } catch (e) {
-    console.error('Failed to join room:', e);
-    logEvent('leave', 'Ошибка подключения: ' + e.message);
-    renderEventLog();
-  }
+    peer.on('error', (err) => {
+      console.error('Peer error:', err.type);
+      if (err.type === 'unavailable-id') {
+        reject(new Error('Комната уже существует. Попробуйте другой код или присоединитесь.'));
+      } else {
+        reject(err);
+      }
+    });
+  });
 }
 
-function handleIncomingConnection(conn) {
-  conn.on('open', () => {
-    const peerId = conn.peer;
-    const meta = conn.metadata || {};
-    const name = meta.name || 'Аноним';
+async function joinExistingRoom(roomPeerId, myPeerId, name) {
+  return new Promise((resolve, reject) => {
+    peer = createPeer(myPeerId);
 
-    if (!getMember(peerId)) {
+    peer.on('open', (id) => {
+      const conn = peer.connect(roomPeerId, {
+        metadata: { name, peerId: id },
+        serialization: 'json',
+        reliable: true
+      });
+
+      conn.on('open', () => {
+        conn.send({ type: 'join', name, peerId: id });
+      });
+
+      conn.on('data', (data) => handleHostData(conn, data));
+      conn.on('close', () => {
+        logEvent('leave', 'Соединение с хостом потеряно');
+        renderEventLog();
+      });
+      conn.on('error', (e) => console.warn('Host conn error:', e));
+
+      updateMember('host', { conn, name: 'Хост' });
+      resolve();
+    });
+
+    peer.on('connection', (conn) => {
+      handleNewPeerConnection(conn);
+    });
+
+    peer.on('call', (call) => {
+      handleIncomingCall(call);
+    });
+
+    peer.on('disconnected', () => {
+      if (peer && !peer.destroyed) {
+        setTimeout(() => { try { peer.reconnect(); } catch(e) {} }, 2000);
+      }
+    });
+
+    peer.on('error', (err) => {
+      console.error('Peer error:', err.type);
+      reject(err);
+    });
+  });
+}
+
+function handleNewPeerConnection(conn) {
+  conn.on('open', () => {
+    const remotePeerId = conn.peer;
+    const meta = conn.metadata || {};
+    const remoteName = meta.name || 'Аноним';
+
+    if (!getMember(remotePeerId)) {
+      addMember(remotePeerId, remoteName);
+      logEvent('join', `${remoteName} зашёл в комнату`);
+      renderMembers();
+      renderEventLog();
+
+      if (isHost) {
+        const members = [];
+        getAllMembers().forEach((m, pid) => {
+          if (pid !== 'local' && pid !== remotePeerId) {
+            members.push({ peerId: pid, name: m.name });
+          }
+        });
+        conn.send({ type: 'room-members', members });
+
+        broadcastToAll({ type: 'peer-joined', peerId: remotePeerId, name: remoteName }, remotePeerId);
+      }
+
+      const localStream = getLocalStream();
+      if (localStream) {
+        callPeer(peer, remotePeerId, localStream, { name: getLocalName() });
+      }
+    }
+
+    updateMember(remotePeerId, { conn });
+
+    conn.on('data', (data) => handlePeerData(remotePeerId, data));
+    conn.on('close', () => handlePeerDisconnect(remotePeerId));
+    conn.on('error', () => handlePeerDisconnect(remotePeerId));
+  });
+}
+
+function handleHostData(conn, data) {
+  if (!data || typeof data !== 'object') return;
+
+  if (data.type === 'room-members' && Array.isArray(data.members)) {
+    data.members.forEach(m => {
+      if (m.peerId !== getLocalPeerId() && !getMember(m.peerId)) {
+        addMember(m.peerId, m.name);
+        logEvent('join', `${m.name} уже в комнате`);
+        renderMembers();
+        renderEventLog();
+
+        const localStream = getLocalStream();
+        if (localStream) {
+          callPeer(peer, m.peerId, localStream, { name: getLocalName() });
+        }
+
+        const dc = connectToPeer(peer, m.peerId, { name: getLocalName() });
+        setupDirectConnection(m.peerId, dc);
+      }
+    });
+  }
+
+  if (data.type === 'peer-joined') {
+    const { peerId, name } = data;
+    if (peerId !== getLocalPeerId() && !getMember(peerId)) {
       addMember(peerId, name);
       logEvent('join', `${name} зашёл в комнату`);
       renderMembers();
       renderEventLog();
-
-      const localStream = getLocalStream();
-      if (localStream) {
-        callPeer(peer, peerId, localStream, { name: getLocalName() });
-      }
     }
+  }
 
-    updateMember(peerId, { conn });
+  if (data.type === 'peer-left') {
+    handlePeerDisconnect(data.peerId);
+  }
+}
 
-    if (isScreenSharing()) {
-      const screenStream = getScreenStream();
-      if (screenStream) {
-        try {
-          peer.call(peerId, screenStream, { metadata: { type: 'screen', name: getLocalName() } });
-        } catch(e) {}
-      }
-    }
-
-    conn.on('data', (data) => handlePeerData(peerId, data));
-    conn.on('close', () => handlePeerDisconnect(peerId));
-    conn.on('error', () => handlePeerDisconnect(peerId));
+function setupDirectConnection(peerId, dc) {
+  dc.on('open', () => {
+    updateMember(peerId, { dataConn: dc });
   });
+  dc.on('data', (data) => handlePeerData(peerId, data));
+  dc.on('close', () => handlePeerDisconnect(peerId));
+  dc.on('error', (e) => console.warn('Direct conn error:', e));
 }
 
 function handleIncomingCall(call) {
@@ -232,11 +327,7 @@ function handleIncomingCall(call) {
   }
 
   const localStream = getLocalStream();
-  if (localStream) {
-    call.answer(localStream);
-  } else {
-    call.answer();
-  }
+  call.answer(localStream);
 
   call.on('stream', (stream) => {
     handleRemoteStream(peerId, stream);
@@ -246,19 +337,21 @@ function handleIncomingCall(call) {
     console.log('Call closed with', peerId);
   });
 
-  setupConnectionMonitor(
-    call.peerConnection,
-    peerId,
-    (failedPeerId) => {
-      scheduleReconnect(failedPeerId, (rpId) => {
-        const m = getMember(rpId);
-        if (m && peer && !peer.destroyed) {
-          const ls = getLocalStream();
-          if (ls) callPeer(peer, rpId, ls, { name: getLocalName() });
-        }
-      });
-    }
-  );
+  if (call.peerConnection) {
+    setupConnectionMonitor(
+      call.peerConnection,
+      peerId,
+      (failedPeerId) => {
+        scheduleReconnect(failedPeerId, (rpId) => {
+          const m = getMember(rpId);
+          if (m && peer && !peer.destroyed) {
+            const ls = getLocalStream();
+            if (ls) callPeer(peer, rpId, ls, { name: getLocalName() });
+          }
+        });
+      }
+    );
+  }
 }
 
 function handleRemoteStream(peerId, stream) {
@@ -278,102 +371,52 @@ function handleRemoteStream(peerId, stream) {
   resetReconnectAttempts(peerId);
 }
 
-function handleControlData(conn, data) {
-  if (!data || typeof data !== 'object') return;
-
-  if (data.type === 'room-members' && Array.isArray(data.members)) {
-    data.members.forEach(m => {
-      if (m.peerId !== getLocalPeerId() && !getMember(m.peerId)) {
-        addMember(m.peerId, m.name);
-        logEvent('join', `${m.name} уже в комнате`);
-        renderMembers();
-        renderEventLog();
-
-        const localStream = getLocalStream();
-        if (localStream) {
-          callPeer(peer, m.peerId, localStream, { name: getLocalName() });
-        }
-
-        const dc = connectToPeer(peer, m.peerId, { name: getLocalName(), type: 'data' });
-        setupDataConnection(m.peerId, dc);
-      }
-    });
-  }
-
-  if (data.type === 'peer-joined') {
-    const { peerId, name } = data;
-    if (peerId !== getLocalPeerId() && !getMember(peerId)) {
-      addMember(peerId, name);
-      logEvent('join', `${name} зашёл в комнату`);
-      renderMembers();
-      renderEventLog();
-    }
-  }
-
-  if (data.type === 'peer-left') {
-    const { peerId, name } = data;
-    removeMember(peerId);
-    logEvent('leave', `${name} вышел из комнаты`);
-    renderMembers();
-    renderEventLog();
-  }
-}
-
 function handlePeerData(peerId, data) {
   if (!data || typeof data !== 'object') return;
 
-  if (data.type === 'file-meta') {
-    const transfer = createIncomingTransfer(peerId, data);
-    renderFileTransfers();
-    return;
-  }
-
-  if (data.type === 'file-chunk') {
-    const transfer = getTransfer(data.transferId);
-    if (!transfer) return;
-
-    const done = handleIncomingChunk(transfer, data.chunk);
-    renderFileTransfers();
-
-    if (done) {
-      const blob = assembleFile(transfer);
-      downloadBlob(blob, transfer.fileName);
-      logEvent('file', `Файл получен: ${transfer.fileName} (${formatBytes(transfer.fileSize)})`);
+  switch (data.type) {
+    case 'file-meta': {
+      createIncomingTransfer(peerId, data);
+      renderFileTransfers();
+      break;
+    }
+    case 'file-chunk': {
+      const transfer = getTransfer(data.transferId);
+      if (!transfer) return;
+      const done = handleIncomingChunk(transfer, data.chunk);
+      renderFileTransfers();
+      if (done) {
+        const blob = assembleFile(transfer);
+        downloadBlob(blob, transfer.fileName);
+        logEvent('file', `Файл получен: ${transfer.fileName} (${formatBytes(transfer.fileSize)})`);
+        renderEventLog();
+        removeTransfer(transfer.id);
+        renderFileTransfers();
+      }
+      break;
+    }
+    case 'file-cancel': {
+      const t = getTransfer(data.transferId);
+      if (t) { removeTransfer(t.id); renderFileTransfers(); }
+      break;
+    }
+    case 'file-pause': {
+      const t = getTransfer(data.transferId);
+      if (t) { t.paused = !t.paused; renderFileTransfers(); }
+      break;
+    }
+    case 'mute-status': {
+      updateMember(peerId, { muted: data.muted });
+      renderMembers();
+      const m = getMember(peerId);
+      logEvent('mute', `${m?.name || 'Участник'} ${data.muted ? 'замутился' : 'размутился'}`);
       renderEventLog();
-      removeTransfer(transfer.id);
-      renderFileTransfers();
+      break;
     }
-    return;
-  }
-
-  if (data.type === 'file-cancel') {
-    const transfer = getTransfer(data.transferId);
-    if (transfer) {
-      transfer.cancelled = true;
-      removeTransfer(transfer.id);
-      renderFileTransfers();
+    case 'screen-stopped': {
+      hideRemoteScreenShare(peerId);
+      break;
     }
-    return;
-  }
-
-  if (data.type === 'file-pause') {
-    const transfer = getTransfer(data.transferId);
-    if (transfer) {
-      transfer.paused = !transfer.paused;
-      renderFileTransfers();
-    }
-    return;
-  }
-
-  if (data.type === 'mute-status') {
-    updateMember(peerId, { muted: data.muted });
-    renderMembers();
-    logEvent('mute', `${getMember(peerId)?.name || 'Аноним'} ${data.muted ? 'замутился' : 'размутился'}`);
-    renderEventLog();
-  }
-
-  if (data.type === 'screen-stopped') {
-    hideRemoteScreenShare(peerId);
   }
 }
 
@@ -381,51 +424,22 @@ function handlePeerDisconnect(peerId) {
   const member = getMember(peerId);
   if (member) {
     const name = member.name;
+    if (member.audioElement) removeAudioElement(member.audioElement);
     removeMember(peerId);
+    clearReconnect(peerId);
     logEvent('leave', `${name} вышел из комнаты`);
     renderMembers();
     renderEventLog();
   }
+
+  if (isHost) {
+    broadcastToAll({ type: 'peer-left', peerId });
+  }
 }
 
-function setupDataConnection(peerId, dc) {
-  dc.on('open', () => {
-    updateMember(peerId, { dataConn: dc });
-  });
-
-  dc.on('data', (data) => {
-    handlePeerData(peerId, data);
-  });
-
-  dc.on('close', () => {
-    handlePeerDisconnect(peerId);
-  });
-
-  dc.on('error', (e) => {
-    console.warn('Data channel error:', e);
-  });
-}
-
-function addLocalMember() {
-  const name = getLocalName();
-  addMember('local', name);
-}
-
-function broadcastMessage(msg) {
+function broadcastToAll(msg, excludePeerId) {
   getAllMembers().forEach((m, peerId) => {
-    if (peerId === 'local') return;
-    if (m.conn && m.conn.open) {
-      try { m.conn.send(msg); } catch(e) {}
-    }
-    if (m.dataConn && m.dataConn.open) {
-      try { m.dataConn.send(msg); } catch(e) {}
-    }
-  });
-}
-
-function broadcastData(msg) {
-  getAllMembers().forEach((m, peerId) => {
-    if (peerId === 'local') return;
+    if (peerId === 'local' || peerId === excludePeerId) return;
     const conn = m.dataConn || m.conn;
     if (conn && conn.open) {
       try { conn.send(msg); } catch(e) {}
@@ -437,7 +451,7 @@ function toggleMute() {
   isMuted = !isMuted;
   if (isMuted) muteMic(); else unmuteMic();
   updateMember('local', { muted: isMuted });
-  broadcastData({ type: 'mute-status', muted: isMuted });
+  broadcastToAll({ type: 'mute-status', muted: isMuted });
   renderMembers();
   logEvent('mute', `${getLocalName()} ${isMuted ? 'замутился' : 'размутился'}`);
   renderEventLog();
@@ -518,16 +532,14 @@ async function startScreenShareAction() {
 function stopScreenShareAction() {
   stopScreenShare();
   updateScreenShareUI(false);
-  broadcastMessage({ type: 'screen-stopped' });
+  broadcastToAll({ type: 'screen-stopped' });
   logEvent('file', `${getLocalName()} остановил демонстрацию экрана`);
   renderEventLog();
 }
 
 function updateScreenShareUI(active) {
-  const panel = $('#screen-share-panel');
-  const btn = $('#btn-screen');
-  panel.style.display = active ? 'flex' : 'none';
-  btn.classList.toggle('active', active);
+  $('#screen-share-panel').style.display = active ? 'flex' : 'none';
+  $('#btn-screen').classList.toggle('active', active);
 }
 
 function showRemoteScreenShare(peerId, stream, name) {
@@ -541,16 +553,14 @@ function showRemoteScreenShare(peerId, stream, name) {
 function hideRemoteScreenShare(peerId) {
   const video = $('#screen-share-video');
   if (video.srcObject) {
-    const tracks = video.srcObject.getTracks();
-    tracks.forEach(t => t.stop());
+    video.srcObject.getTracks().forEach(t => t.stop());
     video.srcObject = null;
   }
   updateScreenShareUI(false);
 }
 
 function closeOverlay() {
-  const overlay = $('#screen-overlay');
-  overlay.style.display = 'none';
+  $('#screen-overlay').style.display = 'none';
   const video = $('#screen-overlay-video');
   if (video.srcObject) {
     video.srcObject.getTracks().forEach(t => t.stop());
@@ -558,27 +568,23 @@ function closeOverlay() {
   }
 }
 
-async function handleFileSelect(e) {
+function handleFileSelect(e) {
   const files = Array.from(e.target.files);
-  if (!files.length) return;
-
-  for (const file of files) {
-    sendFile(file);
-  }
+  files.forEach(f => sendFile(f));
   fileInput.value = '';
 }
 
 async function sendFile(file) {
   const transfer = createOutgoingTransfer('all', file);
 
-  broadcastData({
+  broadcastToAll({
     type: 'file-meta',
     transferId: transfer.id,
     fileName: file.name,
     fileSize: file.size
   });
 
-  logEvent('file', `Отправка файла: ${file.name} (${formatBytes(file.size)})`);
+  logEvent('file', `Отправка: ${file.name} (${formatBytes(file.size)})`);
   renderEventLog();
   renderFileTransfers();
 
@@ -590,55 +596,50 @@ async function sendFile(file) {
   });
 
   if (peers.length === 0) {
-    logEvent('file', 'Нет подключённых участников для отправки');
+    logEvent('file', 'Нет участников для отправки');
     renderEventLog();
     removeTransfer(transfer.id);
     renderFileTransfers();
     return;
   }
 
-  for (const { peerId, dc } of peers) {
-    sendFileToPeer(transfer, file, dc, peerId);
+  for (const { dc } of peers) {
+    sendFileToChannel(transfer, file, dc);
   }
 }
 
-async function sendFileToPeer(transfer, file, dc, peerId) {
-  const t = { ...transfer, offset: 0, peerId };
+async function sendFileToChannel(transfer, file, dc) {
+  let offset = 0;
 
-  while (t.offset < file.size) {
-    if (t.cancelled) {
-      dc.send({ type: 'file-cancel', transferId: t.id });
+  while (offset < file.size) {
+    if (transfer.cancelled) {
+      try { dc.send({ type: 'file-cancel', transferId: transfer.id }); } catch(e) {}
       return;
     }
 
-    while (t.paused) {
+    while (transfer.paused) {
       await sleep(200);
     }
 
-    const end = Math.min(t.offset + CHUNK_SIZE, file.size);
-    const chunk = file.slice(t.offset, end);
-    const buffer = await chunk.arrayBuffer();
+    const end = Math.min(offset + CHUNK_SIZE, file.size);
+    const chunk = file.slice(offset, end);
 
     try {
-      dc.send({
-        type: 'file-chunk',
-        transferId: t.id,
-        chunk: buffer
-      });
+      const buffer = await chunk.arrayBuffer();
+      dc.send({ type: 'file-chunk', transferId: transfer.id, chunk: buffer });
     } catch(e) {
-      console.warn('Send chunk error:', e);
-      await sleep(500);
+      await sleep(100);
       continue;
     }
 
-    t.offset = end;
-    transfer.offset = end;
+    offset = end;
+    transfer.offset = offset;
     renderFileTransfers();
 
-    await sleep(10);
+    await sleep(5);
   }
 
-  logEvent('file', `Файл отправлен: ${file.name}`);
+  logEvent('file', `Отправлено: ${file.name}`);
   renderEventLog();
   removeTransfer(transfer.id);
   renderFileTransfers();
@@ -649,12 +650,10 @@ function downloadBlob(blob, fileName) {
   const a = document.createElement('a');
   a.href = url;
   a.download = fileName;
+  a.style.display = 'none';
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => {
-    URL.revokeObjectURL(url);
-    a.remove();
-  }, 100);
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
 }
 
 function sleep(ms) {
@@ -663,6 +662,8 @@ function sleep(ms) {
 
 function startVuMeter() {
   vuInterval = setInterval(() => {
+    if (!joined) return;
+
     const vol = getVolume();
     updateMember('local', { volume: vol, speaking: vol > 0.05 });
 
@@ -670,24 +671,28 @@ function startVuMeter() {
       const threshold = vaThreshold / 100;
       if (vol > threshold && isMuted) {
         toggleMute();
-      } else if (vol < threshold * 0.5 && !isMuted && !isPTTMode) {
+      } else if (vol < threshold * 0.3 && !isMuted) {
         setTimeout(() => {
-          if (getVolume() < threshold * 0.5 && !isMuted) toggleMute();
-        }, 300);
+          if (getVolume() < threshold * 0.3 && !isMuted) toggleMute();
+        }, 500);
       }
     }
 
+    let needRender = false;
     getAllMembers().forEach((m, peerId) => {
       if (peerId === 'local') return;
       const el = m.audioElement;
       if (el) {
         const speaking = !el.paused && el.currentTime > 0;
-        updateMember(peerId, { speaking });
+        if (m.speaking !== speaking) {
+          updateMember(peerId, { speaking });
+          needRender = true;
+        }
       }
     });
 
     renderMembers();
-  }, 100);
+  }, 150);
 }
 
 function showScreen(name) {
@@ -720,48 +725,56 @@ function copyInviteLink() {
   }).catch(() => {});
 }
 
+let lastMembersHtml = '';
 function renderMembers() {
   const list = $('#members-list');
   const members = getAllMembers();
   $('#members-count').textContent = members.size;
 
-  list.innerHTML = '';
+  let html = '';
   members.forEach((m, peerId) => {
-    const li = document.createElement('li');
-    li.className = 'member';
-    if (m.speaking) li.classList.add('speaking');
-
     const initials = m.name.substring(0, 2).toUpperCase();
     const vuPercent = Math.min(100, Math.round((m.volume || 0) * 200));
+    const speaking = m.speaking ? ' speaking' : '';
 
-    li.innerHTML = `
-      <div class="member-avatar ${m.speaking ? 'speaking' : ''}">${initials}
+    html += `<li class="member${speaking}">
+      <div class="member-avatar${speaking}">${initials}
         <div class="vu-bar"><div class="vu-fill" style="width:${peerId === 'local' ? vuPercent : (m.speaking ? 60 : 0)}%"></div></div>
       </div>
       <span class="member-name">${m.name}${peerId === 'local' ? ' (ты)' : ''}</span>
       ${m.muted ? '<span class="member-muted">🔇</span>' : ''}
-    `;
-    list.appendChild(li);
+    </li>`;
   });
+
+  if (html !== lastMembersHtml) {
+    list.innerHTML = html;
+    lastMembersHtml = html;
+  }
 }
 
+let lastLogCount = 0;
 function renderEventLog() {
   const log = $('#event-log');
   const entries = getEventLog();
-  log.innerHTML = '';
-  entries.forEach(e => {
+
+  if (entries.length === lastLogCount) return;
+
+  while (lastLogCount < entries.length) {
+    const e = entries[lastLogCount];
     const div = document.createElement('div');
     div.className = 'log-entry ' + e.type;
     div.innerHTML = `<span class="time">${e.time}</span>${e.message}`;
     log.appendChild(div);
-  });
+    lastLogCount++;
+  }
+
   log.scrollTop = log.scrollHeight;
 }
 
 function renderFileTransfers() {
   const container = $('#file-transfers');
   const transfers = getAllTransfers();
-  container.innerHTML = '';
+  let html = '';
 
   transfers.forEach((t) => {
     const progress = getTransferProgress(t);
@@ -769,9 +782,7 @@ function renderFileTransfers() {
     const eta = getTransferETA(t);
     const percent = Math.round(progress * 100);
 
-    const div = document.createElement('div');
-    div.className = 'file-transfer';
-    div.innerHTML = `
+    html += `<div class="file-transfer">
       <div class="ft-header">
         <span class="ft-name">${t.direction === 'out' ? '📤' : '📥'} ${t.fileName}</span>
         <span class="ft-info">${formatBytes(t.direction === 'out' ? t.offset : t.receivedSize)} / ${formatBytes(t.fileSize)}</span>
@@ -784,9 +795,10 @@ function renderFileTransfers() {
           <button data-action="cancel" data-id="${t.id}">✕</button>
         </div>
       </div>
-    `;
-    container.appendChild(div);
+    </div>`;
   });
+
+  container.innerHTML = html;
 
   container.querySelectorAll('button[data-action]').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -794,13 +806,12 @@ function renderFileTransfers() {
       const id = e.target.dataset.id;
       const transfer = getTransfer(id);
       if (!transfer) return;
-
       if (action === 'pause') {
         transfer.paused = !transfer.paused;
-        broadcastData({ type: 'file-pause', transferId: id });
+        broadcastToAll({ type: 'file-pause', transferId: id });
       } else if (action === 'cancel') {
         transfer.cancelled = true;
-        broadcastData({ type: 'file-cancel', transferId: id });
+        broadcastToAll({ type: 'file-cancel', transferId: id });
         removeTransfer(id);
       }
       renderFileTransfers();
@@ -809,7 +820,7 @@ function renderFileTransfers() {
 }
 
 async function leaveRoom() {
-  broadcastMessage({ type: 'leave', name: getLocalName() });
+  broadcastToAll({ type: 'leave', name: getLocalName() });
 
   getAllMembers().forEach((m, peerId) => {
     if (peerId === 'local') return;
@@ -823,21 +834,19 @@ async function leaveRoom() {
   clearAllReconnects();
   clearAllTransfers();
 
-  if (vuInterval) {
-    clearInterval(vuInterval);
-    vuInterval = null;
-  }
+  if (vuInterval) { clearInterval(vuInterval); vuInterval = null; }
 
-  if (peer) {
-    try { peer.destroy(); } catch(e) {}
-    peer = null;
-  }
+  if (peer) { try { peer.destroy(); } catch(e) {} peer = null; }
 
   clearRoom();
   isMuted = false;
   isDeafened = false;
   isPTTActive = false;
   isPTTMode = false;
+  isHost = false;
+  joined = false;
+  lastMembersHtml = '';
+  lastLogCount = 0;
 
   window.history.replaceState({}, '', window.location.pathname);
   showScreen('join');
