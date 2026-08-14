@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ватага — P2P голосовой чат</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+  <script type="module" crossorigin src="/assets/index-DAK3PyGr.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/peerjs-CbgI8Vfx.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-BwoSIpuc.css">
+</head>
+<body>
+  <!-- Экран входа -->
+  <div id="screen-join" class="screen active">
+    <div class="join-card">
+      <div class="logo">
+        <span class="logo-icon">🎙️</span>
+        <h1>Ватага</h1>
+        <p class="subtitle">P2P голосовой чат для друзей</p>
+      </div>
+      <div class="join-form">
+        <label for="input-name">Твоё имя</label>
+        <input type="text" id="input-name" placeholder="Как к тебе обращаться?" maxlength="20" autocomplete="off">
+        <label for="input-room">Код комнаты</label>
+        <input type="text" id="input-room" placeholder="Придумай или вставь код" maxlength="30" autocomplete="off">
+        <button id="btn-create" class="btn btn-primary">Создать комнату</button>
+        <button id="btn-join" class="btn btn-secondary">Войти в комнату</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Экран комнаты -->
+  <div id="screen-room" class="screen">
+    <!-- Верхняя панель -->
+    <header class="room-header">
+      <div class="room-info">
+        <span class="logo-small">🎙️ Ватага</span>
+        <span id="room-code-display" class="room-code" title="Нажми, чтобы скопировать"></span>
+        <button id="btn-copy-link" class="btn-icon" title="Скопировать ссылку">📋</button>
+      </div>
+      <div class="room-actions">
+        <button id="btn-leave" class="btn btn-danger btn-sm">Покинуть</button>
+      </div>
+    </header>
+
+    <!-- Основная область -->
+    <div class="room-body">
+      <!-- Левая панель: участники -->
+      <aside class="panel panel-members">
+        <h3>Участники <span id="members-count">0</span>/8</h3>
+        <ul id="members-list"></ul>
+      </aside>
+
+      <!-- Центр: управление + лог -->
+      <main class="panel panel-main">
+        <!-- Панель управления -->
+        <div class="controls-bar">
+          <button id="btn-mic" class="ctrl-btn" title="Микрофон (M)">🎤</button>
+          <button id="btn-deaf" class="ctrl-btn" title="Деафен (D)">🔊</button>
+          <button id="btn-ptt" class="ctrl-btn toggle" title="Push-to-Talk (Space)">PTT</button>
+          <button id="btn-screen" class="ctrl-btn" title="Демонстрация экрана">🖥️</button>
+          <button id="btn-file" class="ctrl-btn" title="Отправить файл">📁</button>
+          <div class="controls-spacer"></div>
+          <div class="audio-toggles">
+            <label class="toggle-label" title="Шумоподавление">
+              <input type="checkbox" id="toggle-ns" checked> ШП
+            </label>
+            <label class="toggle-label" title="Эхокомпенсация">
+              <input type="checkbox" id="toggle-ec" checked> ЭХ
+            </label>
+            <label class="toggle-label" title="Автоматическая регулировка усиления">
+              <input type="checkbox" id="toggle-agc" checked> АРУ
+            </label>
+            <label class="toggle-label" title="Голосовая активация">
+              <input type="checkbox" id="toggle-va"> ВА
+            </label>
+            <label class="toggle-label" title="Порог голосовой активации">
+              <input type="range" id="va-threshold" min="0" max="100" value="30" class="va-slider">
+            </label>
+          </div>
+        </div>
+
+        <!-- Лог событий -->
+        <div class="event-log-container">
+          <h3>Лог комнаты</h3>
+          <div id="event-log"></div>
+        </div>
+
+        <!-- Прогресс файлов -->
+        <div id="file-transfers" class="file-transfers"></div>
+      </main>
+
+      <!-- Правая панель: скриншар -->
+      <aside class="panel panel-screen" id="screen-share-panel" style="display:none;">
+        <h3>Демонстрация экрана</h3>
+        <div id="screen-share-container">
+          <video id="screen-share-video" autoplay playsinline></video>
+        </div>
+        <button id="btn-stop-screen" class="btn btn-danger btn-sm">Остановить</button>
+      </aside>
+    </div>
+  </div>
+
+  <!-- Оверлей скриншара -->
+  <div id="screen-overlay" class="screen-overlay" style="display:none;">
+    <video id="screen-overlay-video" autoplay playsinline></video>
+    <button id="btn-close-overlay" class="overlay-close">✕</button>
+  </div>
+
+  <!-- Скрытый input для файлов -->
+  <input type="file" id="file-input" multiple style="display:none;">
+
+</body>
+</html>
